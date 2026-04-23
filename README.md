@@ -1,302 +1,565 @@
-# Outlook Unified Inbox (VBA)
+# Outlook Unified Inbox
 
-A VBA macro for Outlook Classic that syncs emails from all account inboxes into a single unified folder in real time.
+A lightweight VBA macro for **Outlook Classic on Windows** that creates a practical unified inbox by automatically copying incoming mail from multiple account inboxes into one real Outlook folder.
 
-## How It Works
+Instead of relying on a search view or Outlook’s built-in aggregate views, this project uses a real folder that you choose and keeps it populated with incoming messages from all watched inboxes.
 
-- On startup, watches every account's inbox using `WithEvents` — new mail is copied to the unified folder instantly
-- A periodic timer sweeps all inboxes every 5 minutes to catch anything missed
-- On first run, prompts you to pick the target folder; saves the selection to the Windows registry
-- Checks the 100 most recent emails per inbox on each sweep
-- Snapshots inbox EntryIDs before processing — never mutates a live collection mid-loop
-- Writes a timestamped log file to `%USERPROFILE%\UnifiedInbox.log` for troubleshooting
+## Features
 
-## Files
+- Watches the Inbox of each Outlook account/store
+- Copies new incoming messages into a single chosen Unified Inbox folder
+- Uses a **real Outlook folder**, not just a search or filtered view
+- Runs entirely inside Outlook VBA
+- Lightweight and easy to customize
+- Optional metadata-based sync logic between source items and unified copies
+- Supports delete syncing between the source inbox and the unified folder for newly linked items
 
-| File | Type | Purpose |
-|------|------|---------|
-| `ThisOutlookSession` | Built-in | Startup/quit hooks |
-| `modUnifiedSync` | Module | Timer, sync logic, folder management, logging |
-| `clsInboxEvents` | Class Module | Per-inbox `WithEvents` watcher |
+## Why this exists
 
-## Installation
+Outlook Classic does not offer a simple true unified inbox folder across multiple accounts in the way many users expect. This project works around that limitation by copying messages into a real destination folder that can be pinned, sorted, searched, and used like a normal inbox.
 
-1. Open Outlook, press **Alt+F11** to open the VBA Editor
-2. In the Project Explorer (left panel), expand **Project (VbaProject.OTM)**
-3. **Add the module:** Insert → Module → rename to `modUnifiedSync` → paste contents below
-4. **Add the class:** Insert → Class Module → press F4, set `Name` to `clsInboxEvents` → paste contents below
-5. **Edit ThisOutlookSession:** double-click it → replace all contents with the code below
-6. Save (**Ctrl+S**), close and reopen Outlook
-7. On first launch you will be prompted to pick your unified folder — select it once and it is remembered
+## How it works
 
-## Code
+The macro attaches Outlook item event handlers to:
 
-### `ThisOutlookSession`
+- each source Inbox
+- the selected Unified Inbox folder
+
+When a new message arrives in a watched source inbox, the macro:
+
+1. detects the new mail item
+2. creates a copy
+3. moves the copy into the chosen Unified Inbox folder
+4. stores hidden metadata that links the copy to the original item
+5. optionally stores reverse-link metadata on the original item
+
+When a linked message is deleted, the macro compares folder snapshots to determine which item was removed and attempts to delete the matching counterpart.
+
+## Requirements
+
+- **Microsoft Outlook Classic for Windows**
+- VBA/macros enabled
+- A real Outlook folder to use as the Unified Inbox
+- One or more configured Outlook accounts/stores
+
+## Project structure
+
+- `ThisOutlookSession`  
+  Starts the macro when Outlook launches.
+
+- `modUnified`  
+  Contains the main logic for:
+  - startup
+  - folder selection
+  - syncing
+  - metadata storage
+  - snapshot rebuilding
+  - delete handling
+
+- `clsFolderWatcher`  
+  Watches inbox and unified-folder item events.
+
+## Setup
+
+1. Open Outlook Classic.
+2. Press `Alt + F11` to open the VBA editor.
+3. Import or paste the project files into Outlook VBA:
+   - `ThisOutlookSession`
+   - `modUnified`
+   - `clsFolderWatcher`
+4. Save the VBA project.
+5. Restart Outlook.
+6. When prompted, choose the real folder you want to use as your Unified Inbox.
+
+## File Contents
+
+modUnified
+
 ```vb
 Option Explicit
 
-Private Sub Application_Startup()
-    LogMsg "=== Outlook started ==="
-    LogMsg "Session stores count: " & Application.Session.Stores.Count
-    InitWatchers
-    StartTimer
-    RunUnifiedSync
-    LogMsg "Startup complete"
-End Sub
+' =========================
+' GLOBALS
+' =========================
 
-Private Sub Application_Quit()
-    LogMsg "=== Outlook quitting ==="
-    StopTimer
-End Sub
-```
+Public FolderWatchers As Collection
+Public FolderSnapshots As Object ' Dictionary(folderKey -> Dictionary(itemEntryID -> packed links))
+Public gIsDeleteSyncing As Boolean
 
-### `clsInboxEvents`
-```vb
-Option Explicit
+Private Const APP_NAME As String = "UnifiedInbox"
+Private Const APP_SECTION As String = "Config"
 
-Public WithEvents Items As Outlook.Items
+Private Const PROP_SOURCE_ENTRYID As String = "http://schemas.microsoft.com/mapi/string/{5C2D5A1F-9F4B-4C4B-9C45-8E1D3D8A1001}/Unified_SourceEntryID"
+Private Const PROP_SOURCE_STOREID As String = "http://schemas.microsoft.com/mapi/string/{5C2D5A1F-9F4B-4C4B-9C45-8E1D3D8A1001}/Unified_SourceStoreID"
+Private Const PROP_SOURCE_FOLDER As String = "http://schemas.microsoft.com/mapi/string/{5C2D5A1F-9F4B-4C4B-9C45-8E1D3D8A1001}/Unified_SourceFolderPath"
 
-Private Sub Items_ItemAdd(ByVal Item As Object)
-    If TypeOf Item Is Outlook.MailItem Then
-        Dim unified As Outlook.Folder
-        Set unified = GetUnifiedFolder()
-        If unified Is Nothing Then Exit Sub
+Private Const PROP_UNIFIED_ENTRYID As String = "http://schemas.microsoft.com/mapi/string/{5C2D5A1F-9F4B-4C4B-9C45-8E1D3D8A1001}/Unified_CopyEntryID"
+Private Const PROP_UNIFIED_STOREID As String = "http://schemas.microsoft.com/mapi/string/{5C2D5A1F-9F4B-4C4B-9C45-8E1D3D8A1001}/Unified_CopyStoreID"
+Private Const PROP_UNIFIED_FOLDER As String = "http://schemas.microsoft.com/mapi/string/{5C2D5A1F-9F4B-4C4B-9C45-8E1D3D8A1001}/Unified_CopyFolderPath"
 
-        On Error Resume Next
-        SyncNewItem Item, unified
-        On Error GoTo 0
-    End If
-End Sub
-```
+' =========================
+' STARTUP
+' =========================
 
-### `modUnifiedSync`
-```vb
-Option Explicit
-
-#If VBA7 Then
-    Private Declare PtrSafe Function SetTimer Lib "user32" (ByVal hwnd As LongPtr, ByVal nIDEvent As LongPtr, ByVal uElapse As Long, ByVal lpTimerFunc As LongPtr) As LongPtr
-    Private Declare PtrSafe Function KillTimer Lib "user32" (ByVal hwnd As LongPtr, ByVal nIDEvent As LongPtr) As Long
-    Private timerID As LongPtr
-#Else
-    Private Declare Function SetTimer Lib "user32" (ByVal hwnd As Long, ByVal nIDEvent As Long, ByVal uElapse As Long, ByVal lpTimerFunc As Long) As Long
-    Private Declare Function KillTimer Lib "user32" (ByVal hwnd As Long, ByVal nIDEvent As Long) As Long
-    Private timerID As Long
-#End If
-
-Private watchers As New Collection
-Public isSyncRunning As Boolean
-Public lastSync As Date
-
-' ---------------------------------------------------------------------------
-' Logging
-' ---------------------------------------------------------------------------
-
-Public Sub LogMsg(msg As String)
-    Dim logPath As String
-    logPath = Environ("USERPROFILE") & "\UnifiedInbox.log"
-
-    Dim fileNum As Integer
-    fileNum = FreeFile
-    Open logPath For Append As #fileNum
-    Print #fileNum, Format(Now, "yyyy-mm-dd hh:nn:ss") & " | " & msg
-    Close #fileNum
-End Sub
-
-' ---------------------------------------------------------------------------
-' Watchers
-' ---------------------------------------------------------------------------
-
-Public Sub InitWatchers()
+Public Sub ManualStartup()
     Dim ns As Outlook.NameSpace
-    Dim store As Outlook.Store
-    Dim inbox As Outlook.Folder
-    Dim w As clsInboxEvents
+    Dim store As Outlook.store
+    Dim inbox As Outlook.folder
+    Dim unified As Outlook.folder
+    Dim watcher As clsFolderWatcher
 
     Set ns = Application.Session
-    LogMsg "InitWatchers: " & ns.Stores.Count & " store(s) found"
+    Set FolderWatchers = New Collection
+    Set FolderSnapshots = CreateObject("Scripting.Dictionary")
 
+    ' Watch every real inbox
     For Each store In ns.Stores
         Set inbox = Nothing
+
         On Error Resume Next
         Set inbox = store.GetDefaultFolder(olFolderInbox)
         On Error GoTo 0
 
         If Not inbox Is Nothing Then
-            LogMsg "  Watching inbox: " & store.DisplayName
-            Set w = New clsInboxEvents
-            Set w.Items = inbox.Items
-            watchers.Add w
-        Else
-            LogMsg "  Skipped (no inbox): " & store.DisplayName
+            Set watcher = New clsFolderWatcher
+            Set watcher.items = inbox.items
+            watcher.FolderStoreID = inbox.storeID
+            watcher.FolderEntryID = inbox.entryID
+            watcher.FolderPath = inbox.FolderPath
+            watcher.isUnified = False
+            FolderWatchers.Add watcher
+
+            Debug.Print "Watching source inbox: " & inbox.FolderPath
         End If
     Next store
 
-    LogMsg "InitWatchers complete, watchers: " & watchers.Count
-End Sub
-
-' ---------------------------------------------------------------------------
-' Timer
-' ---------------------------------------------------------------------------
-
-Public Sub StartTimer()
-    StopTimer
-    timerID = SetTimer(0, 0, 300000, AddressOf TimerCallback) ' 5 minutes
-End Sub
-
-Public Sub StopTimer()
-    If timerID <> 0 Then
-        KillTimer 0, timerID
-        timerID = 0
-    End If
-End Sub
-
-#If VBA7 Then
-Public Sub TimerCallback(ByVal hwnd As LongPtr, ByVal uMsg As Long, ByVal idEvent As LongPtr, ByVal dwTime As Long)
-#Else
-Public Sub TimerCallback(ByVal hwnd As Long, ByVal uMsg As Long, ByVal idEvent As Long, ByVal dwTime As Long)
-#End If
-    RunUnifiedSync
-End Sub
-
-' ---------------------------------------------------------------------------
-' Sync orchestration
-' ---------------------------------------------------------------------------
-
-Public Sub RunUnifiedSync()
-    If isSyncRunning Then
-        LogMsg "RunUnifiedSync: already running, skipped"
-        Exit Sub
-    End If
-    If lastSync <> 0 And Now - lastSync < TimeValue("00:01:00") Then
-        LogMsg "RunUnifiedSync: too soon since last sync, skipped"
-        Exit Sub
-    End If
-
-    LogMsg "RunUnifiedSync: starting"
-    isSyncRunning = True
-    lastSync = Now
-
-    On Error GoTo Cleanup
-    SyncAllInboxesToUnified
-    LogMsg "RunUnifiedSync: finished"
-
-Cleanup:
-    If Err.Number <> 0 Then LogMsg "RunUnifiedSync ERROR: " & Err.Description
-    isSyncRunning = False
-End Sub
-
-Public Sub SyncAllInboxesToUnified()
-    Dim ns As Outlook.NameSpace
-    Dim store As Outlook.Store
-    Dim inbox As Outlook.Folder
-
-    Set ns = Application.Session
-
-    For Each store In ns.Stores
-        Set inbox = Nothing
-        On Error Resume Next
-        Set inbox = store.GetDefaultFolder(olFolderInbox)
-        On Error GoTo 0
-
-        If Not inbox Is Nothing Then
-            SyncInbox inbox
-        End If
-    Next store
-End Sub
-
-Public Sub SyncInbox(inbox As Outlook.Folder)
-    LogMsg "SyncInbox: " & inbox.Parent.Name & " (" & inbox.Items.Count & " items)"
-
-    Dim unified As Outlook.Folder
+    ' Watch unified folder
     Set unified = GetUnifiedFolder()
-    If unified Is Nothing Then
-        LogMsg "SyncInbox: unified folder not found, aborting"
+    If Not unified Is Nothing Then
+        Set watcher = New clsFolderWatcher
+        Set watcher.items = unified.items
+        watcher.FolderStoreID = unified.storeID
+        watcher.FolderEntryID = unified.entryID
+        watcher.FolderPath = unified.FolderPath
+        watcher.isUnified = True
+        FolderWatchers.Add watcher
+
+        Debug.Print "Watching unified folder: " & unified.FolderPath
+    Else
+        Debug.Print "No unified folder selected."
+    End If
+
+    RefreshAllSnapshots
+    Debug.Print "Startup complete. Watchers: " & FolderWatchers.Count
+End Sub
+
+' =========================
+' MAIN EVENT HANDLERS
+' =========================
+
+Public Sub HandleSourceItemAdd(ByVal watcher As clsFolderWatcher, ByVal Item As Outlook.MailItem)
+    Dim unified As Outlook.folder
+    Dim sourceFolder As Outlook.folder
+    Dim tmpCopy As Outlook.MailItem
+    Dim unifiedCopy As Outlook.MailItem
+    Dim movedObj As Object
+    Dim existingUnified As Object
+    Dim existingUnifiedID As String
+    Dim existingUnifiedStoreID As String
+    Dim srcLive As Object
+
+    On Error GoTo CleanFail
+
+    Set unified = GetUnifiedFolder()
+    If unified Is Nothing Then Exit Sub
+
+    Set sourceFolder = Item.Parent
+
+    ' Skip if this somehow is already in unified
+    If sourceFolder.entryID = unified.entryID Then Exit Sub
+
+    ' If source already linked to a live unified copy, skip
+    existingUnifiedID = GetUserPropValue(Item, PROP_UNIFIED_ENTRYID)
+    existingUnifiedStoreID = GetUserPropValue(Item, PROP_UNIFIED_STOREID)
+
+    If Len(existingUnifiedID) > 0 And Len(existingUnifiedStoreID) > 0 Then
+        On Error Resume Next
+        Set existingUnified = Application.Session.GetItemFromID(existingUnifiedID, existingUnifiedStoreID)
+        On Error GoTo CleanFail
+
+        If Not existingUnified Is Nothing Then
+            Debug.Print "Source already linked, skipping copy: " & Item.Subject
+            Exit Sub
+        End If
+    End If
+
+    Debug.Print "Copying new source item to unified: " & Item.Subject
+
+    Set tmpCopy = Item.Copy
+    If tmpCopy Is Nothing Then
+        Debug.Print "Copy failed."
         Exit Sub
     End If
 
-    Dim ns As Outlook.NameSpace
-    Set ns = Application.Session
+    ' Stamp the COPY with source references BEFORE moving it
+    AddOrSetUserProp tmpCopy, PROP_SOURCE_ENTRYID, Item.entryID
+    AddOrSetUserProp tmpCopy, PROP_SOURCE_STOREID, sourceFolder.storeID
+    AddOrSetUserProp tmpCopy, PROP_SOURCE_FOLDER, sourceFolder.FolderPath
 
-    ' Snapshot unified folder keys (capped at 200)
-    Dim copied As Object
-    Set copied = CreateObject("Scripting.Dictionary")
+    tmpCopy.Save
 
-    Dim uItems As Outlook.Items
-    Set uItems = unified.Items
-    uItems.Sort "[ReceivedTime]", True
+    Set movedObj = tmpCopy.Move(unified)
+    If movedObj Is Nothing Then
+        Debug.Print "Move to unified failed."
+        Exit Sub
+    End If
 
-    Dim uLimit As Long
-    uLimit = uItems.Count
-    If uLimit > 200 Then uLimit = 200
+    If Not TypeOf movedObj Is Outlook.MailItem Then
+        Debug.Print "Moved object is not a MailItem."
+        Exit Sub
+    End If
 
-    Dim j As Long
-    For j = 1 To uLimit
-        Dim uItm As Object
-        Set uItm = uItems(j)
-        If TypeOf uItm Is Outlook.MailItem Then
-            Dim uMail As Outlook.MailItem
-            Set uMail = uItm
-            copied(uMail.Subject & "|" & Format(uMail.ReceivedTime, "yyyymmddhhnnss")) = True
-        End If
-    Next j
+    Set unifiedCopy = movedObj
 
-    ' Snapshot inbox EntryIDs — never mutate a live collection while iterating
-    Dim inboxItems As Outlook.Items
-    Set inboxItems = inbox.Items
-    inboxItems.Sort "[ReceivedTime]", True
+    Debug.Print "Unified copy moved successfully."
+    Debug.Print "  Unified EntryID: " & unifiedCopy.entryID
+    Debug.Print "  Unified StoreID: " & unified.storeID
 
-    Dim entryIDs(99) As String
-    Dim candidateCount As Long
+    ' Reacquire the live source item, then stamp it with unified references
+    Set srcLive = Nothing
+    On Error Resume Next
+    Set srcLive = Application.Session.GetItemFromID(Item.entryID, sourceFolder.storeID)
+    On Error GoTo CleanFail
 
-    Dim i As Long
-    For i = 1 To inboxItems.Count
-        Dim itm As Object
-        Set itm = inboxItems(i)
-        If TypeOf itm Is Outlook.MailItem Then
-            entryIDs(candidateCount) = itm.EntryID
-            candidateCount = candidateCount + 1
-            If candidateCount >= 100 Then Exit For
-        End If
-    Next i
+    If Not srcLive Is Nothing Then
+        AddOrSetUserProp srcLive, PROP_UNIFIED_ENTRYID, unifiedCopy.entryID
+        AddOrSetUserProp srcLive, PROP_UNIFIED_STOREID, unified.storeID
+        AddOrSetUserProp srcLive, PROP_UNIFIED_FOLDER, unified.FolderPath
+        Debug.Print "Stamped source item with unified IDs."
+    Else
+        Debug.Print "Could not reacquire live source item for unified backlink."
+    End If
 
-    ' Process candidates outside the live loop
-    Dim k As Long
-    For k = 0 To candidateCount - 1
-        DoEvents
-        Dim mail As Outlook.MailItem
-        On Error Resume Next
-        Set mail = ns.GetItemFromID(entryIDs(k))
-        On Error GoTo 0
+    Debug.Print "Linked source <-> unified"
+    Debug.Print "  Source:  " & Item.Subject
+    Debug.Print "  Unified: " & unifiedCopy.Subject
 
-        If Not mail Is Nothing Then
-            Dim mailKey As String
-            mailKey = mail.Subject & "|" & Format(mail.ReceivedTime, "yyyymmddhhnnss")
-            If copied.Exists(mailKey) Then
-                LogMsg "  Hit already-synced item at k=" & k & ", stopping"
-                Exit For
-            End If
-            SyncNewItem mail, unified
+    RefreshSnapshotForFolderKey MakeFolderKey(sourceFolder.storeID, sourceFolder.entryID)
+    RefreshSnapshotForFolderKey MakeFolderKey(unified.storeID, unified.entryID)
+
+CleanExit:
+    Set srcLive = Nothing
+    Set existingUnified = Nothing
+    Set movedObj = Nothing
+    Set unifiedCopy = Nothing
+    Set tmpCopy = Nothing
+    Set sourceFolder = Nothing
+    Set unified = Nothing
+    Exit Sub
+
+CleanFail:
+    Debug.Print "HandleSourceItemAdd ERROR: " & Err.Description
+    Resume CleanExit
+End Sub
+
+Public Sub HandleFolderRemove(ByVal watcher As clsFolderWatcher)
+    Dim folderKey As String
+    Dim oldSnap As Object
+    Dim newSnap As Object
+    Dim missingKeys As Collection
+    Dim k As Variant
+    Dim packed As String
+    Dim link As Object
+
+    On Error GoTo CleanFail
+
+    folderKey = MakeFolderKey(watcher.FolderStoreID, watcher.FolderEntryID)
+
+    If gIsDeleteSyncing Then
+        Debug.Print "Delete sync already in progress. Rebuilding snapshots only."
+        RefreshAllSnapshots
+        Exit Sub
+    End If
+
+    If FolderSnapshots Is Nothing Then
+        Set FolderSnapshots = CreateObject("Scripting.Dictionary")
+    End If
+
+    If Not FolderSnapshots.Exists(folderKey) Then
+        Debug.Print "No old snapshot found for folder, rebuilding."
+        RefreshSnapshotForFolderKey folderKey
+        Exit Sub
+    End If
+
+    Set oldSnap = FolderSnapshots(folderKey)
+    Set newSnap = BuildSnapshotForFolder(GetFolderByIDs(watcher.FolderStoreID, watcher.FolderEntryID), watcher.isUnified)
+    Set missingKeys = FindMissingKeys(oldSnap, newSnap)
+
+    If missingKeys.Count = 0 Then
+        Set FolderSnapshots(folderKey) = newSnap
+        Debug.Print "No missing items detected after ItemRemove."
+        Exit Sub
+    End If
+
+    gIsDeleteSyncing = True
+
+    For Each k In missingKeys
+        packed = CStr(oldSnap(CStr(k)))
+        Set link = UnpackLink(packed)
+
+        Debug.Print "Missing item detected from: " & watcher.FolderPath
+        Debug.Print "  Removed item key: " & CStr(k)
+
+        If watcher.isUnified Then
+            ' Deleted from unified -> delete source original
+            DeleteCounterpart link("sourceEntryID"), link("sourceStoreID"), "source"
+        Else
+            ' Deleted from source inbox -> delete unified copy
+            DeleteCounterpart link("unifiedEntryID"), link("unifiedStoreID"), "unified"
         End If
     Next k
 
-    LogMsg "SyncInbox done: processed " & k & " candidate(s)"
+    RefreshAllSnapshots
+
+CleanExit:
+    gIsDeleteSyncing = False
+    Exit Sub
+
+CleanFail:
+    Debug.Print "HandleFolderRemove ERROR: " & Err.Description
+    Resume CleanExit
 End Sub
 
-Public Sub SyncNewItem(mail As Outlook.MailItem, unified As Outlook.Folder)
-    Dim copyItem As Outlook.MailItem
-    Set copyItem = mail.Copy
-    copyItem.Save
-    copyItem.Move unified
-    Set copyItem = Nothing
+Private Sub DeleteCounterpart(ByVal entryID As String, ByVal storeID As String, ByVal sideName As String)
+    Dim obj As Object
+
+    If Len(entryID) = 0 Or Len(storeID) = 0 Then
+        Debug.Print "DeleteCounterpart skipped: missing " & sideName & " IDs."
+        Exit Sub
+    End If
+
+    On Error Resume Next
+    Set obj = Application.Session.GetItemFromID(entryID, storeID)
+    On Error GoTo 0
+
+    If obj Is Nothing Then
+        Debug.Print "DeleteCounterpart failed: could not resolve " & sideName & " item."
+        Exit Sub
+    End If
+
+    Debug.Print "Deleting " & sideName & " counterpart: " & obj.Subject
+    obj.Delete
 End Sub
 
-' ---------------------------------------------------------------------------
-' Folder management
-' ---------------------------------------------------------------------------
+' =========================
+' SNAPSHOTS
+' =========================
 
-Public Function GetUnifiedFolder() As Outlook.Folder
-    Static cachedFolder As Outlook.Folder
+Public Sub RefreshAllSnapshots()
+    Dim i As Long
+    Dim watcher As clsFolderWatcher
+    Dim folderKey As String
+
+    If FolderWatchers Is Nothing Then
+        Debug.Print "RefreshAllSnapshots aborted: FolderWatchers is Nothing."
+        Exit Sub
+    End If
+
+    If FolderSnapshots Is Nothing Then
+        Set FolderSnapshots = CreateObject("Scripting.Dictionary")
+    End If
+
+    For i = 1 To FolderWatchers.Count
+        Set watcher = FolderWatchers(i)
+
+        If watcher Is Nothing Then
+            Debug.Print "Watcher #" & i & " is Nothing. Skipping."
+        Else
+            folderKey = MakeFolderKey(watcher.FolderStoreID, watcher.FolderEntryID)
+
+            If FolderSnapshots.Exists(folderKey) Then
+                Set FolderSnapshots(folderKey) = BuildSnapshotForFolder( _
+                    GetFolderByIDs(watcher.FolderStoreID, watcher.FolderEntryID), _
+                    watcher.isUnified)
+            Else
+                FolderSnapshots.Add folderKey, BuildSnapshotForFolder( _
+                    GetFolderByIDs(watcher.FolderStoreID, watcher.FolderEntryID), _
+                    watcher.isUnified)
+            End If
+        End If
+    Next i
+
+    Debug.Print "All snapshots refreshed."
+End Sub
+
+Public Sub RefreshSnapshotForFolderKey(ByVal folderKey As String)
+    Dim i As Long
+    Dim watcher As clsFolderWatcher
+
+    If FolderWatchers Is Nothing Then
+        Debug.Print "RefreshSnapshotForFolderKey aborted: FolderWatchers is Nothing."
+        Exit Sub
+    End If
+
+    If FolderSnapshots Is Nothing Then
+        Set FolderSnapshots = CreateObject("Scripting.Dictionary")
+    End If
+
+    For i = 1 To FolderWatchers.Count
+        Set watcher = FolderWatchers(i)
+
+        If Not watcher Is Nothing Then
+            If MakeFolderKey(watcher.FolderStoreID, watcher.FolderEntryID) = folderKey Then
+                If FolderSnapshots.Exists(folderKey) Then
+                    Set FolderSnapshots(folderKey) = BuildSnapshotForFolder( _
+                        GetFolderByIDs(watcher.FolderStoreID, watcher.FolderEntryID), _
+                        watcher.isUnified)
+                Else
+                    FolderSnapshots.Add folderKey, BuildSnapshotForFolder( _
+                        GetFolderByIDs(watcher.FolderStoreID, watcher.FolderEntryID), _
+                        watcher.isUnified)
+                End If
+
+                Debug.Print "Snapshot refreshed: " & watcher.FolderPath
+                Exit Sub
+            End If
+        End If
+    Next i
+End Sub
+
+Private Function BuildSnapshotForFolder(ByVal folder As Outlook.folder, ByVal isUnified As Boolean) As Object
+    Dim dict As Object
+    Dim items As Outlook.items
+    Dim i As Long
+    Dim itm As Object
+    Dim mail As Outlook.MailItem
+    Dim packed As String
+
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    If folder Is Nothing Then
+        Set BuildSnapshotForFolder = dict
+        Exit Function
+    End If
+
+    Set items = folder.items
+
+    For i = 1 To items.Count
+        Set itm = items(i)
+
+        If TypeOf itm Is Outlook.MailItem Then
+            Set mail = itm
+
+            If isUnified Then
+                packed = PackLink( _
+                    GetUserPropValue(mail, PROP_SOURCE_ENTRYID), _
+                    GetUserPropValue(mail, PROP_SOURCE_STOREID), _
+                    mail.entryID, _
+                    folder.storeID)
+            Else
+                packed = PackLink( _
+                    mail.entryID, _
+                    folder.storeID, _
+                    GetUserPropValue(mail, PROP_UNIFIED_ENTRYID), _
+                    GetUserPropValue(mail, PROP_UNIFIED_STOREID))
+            End If
+
+            dict(mail.entryID) = packed
+        End If
+    Next i
+
+    Set BuildSnapshotForFolder = dict
+End Function
+
+Private Function FindMissingKeys(ByVal oldSnap As Object, ByVal newSnap As Object) As Collection
+    Dim c As New Collection
+    Dim k As Variant
+
+    For Each k In oldSnap.Keys
+        If Not newSnap.Exists(CStr(k)) Then
+            c.Add CStr(k)
+        End If
+    Next k
+
+    Set FindMissingKeys = c
+End Function
+
+' =========================
+' HELPERS
+' =========================
+
+Private Function MakeFolderKey(ByVal storeID As String, ByVal entryID As String) As String
+    MakeFolderKey = storeID & "|" & entryID
+End Function
+
+Private Function PackLink(ByVal sourceEntryID As String, ByVal sourceStoreID As String, _
+                          ByVal unifiedEntryID As String, ByVal unifiedStoreID As String) As String
+    PackLink = sourceEntryID & "||" & sourceStoreID & "||" & unifiedEntryID & "||" & unifiedStoreID
+End Function
+
+Private Function UnpackLink(ByVal packed As String) As Object
+    Dim d As Object
+    Dim parts() As String
+
+    Set d = CreateObject("Scripting.Dictionary")
+    parts = Split(packed, "||")
+
+    d("sourceEntryID") = ""
+    d("sourceStoreID") = ""
+    d("unifiedEntryID") = ""
+    d("unifiedStoreID") = ""
+
+    If UBound(parts) >= 0 Then d("sourceEntryID") = parts(0)
+    If UBound(parts) >= 1 Then d("sourceStoreID") = parts(1)
+    If UBound(parts) >= 2 Then d("unifiedEntryID") = parts(2)
+    If UBound(parts) >= 3 Then d("unifiedStoreID") = parts(3)
+
+    Set UnpackLink = d
+End Function
+
+Private Function GetFolderByIDs(ByVal storeID As String, ByVal entryID As String) As Outlook.folder
+    Dim f As Outlook.folder
+
+    On Error Resume Next
+    Set f = Application.Session.GetFolderFromID(entryID, storeID)
+    On Error GoTo 0
+
+    Set GetFolderByIDs = f
+End Function
+
+Private Sub AddOrSetUserProp(ByVal mail As Outlook.MailItem, ByVal propName As String, ByVal propValue As String)
+    On Error GoTo EH
+
+    mail.PropertyAccessor.SetProperty propName, propValue
+    mail.Save
+
+    Debug.Print "SetProperty OK: " & propName & " = " & propValue
+    Exit Sub
+
+EH:
+    Debug.Print "SetProperty FAILED: " & propName & " | " & Err.Number & " | " & Err.Description
+End Sub
+
+Private Function GetUserPropValue(ByVal mail As Outlook.MailItem, ByVal propName As String) As String
+    On Error GoTo EH
+
+    GetUserPropValue = CStr(mail.PropertyAccessor.GetProperty(propName))
+    Exit Function
+
+EH:
+    GetUserPropValue = ""
+End Function
+
+' =========================
+' UNIFIED FOLDER PICKER
+' =========================
+
+Public Function GetUnifiedFolder() As Outlook.folder
+    Static cachedFolder As Outlook.folder
     Dim ns As Outlook.NameSpace
+    Dim folderID As String
+    Dim storeID As String
+
     Set ns = Application.Session
 
     If Not cachedFolder Is Nothing Then
@@ -304,98 +567,189 @@ Public Function GetUnifiedFolder() As Outlook.Folder
         Exit Function
     End If
 
-    Dim folderID As String, storeID As String
-    folderID = GetSetting("UnifiedInbox", "Config", "FolderID", "")
-    storeID = GetSetting("UnifiedInbox", "Config", "StoreID", "")
+    folderID = GetSetting(APP_NAME, APP_SECTION, "FolderID", "")
+    storeID = GetSetting(APP_NAME, APP_SECTION, "StoreID", "")
 
     If folderID <> "" And storeID <> "" Then
         On Error Resume Next
         Set cachedFolder = ns.GetFolderFromID(folderID, storeID)
         On Error GoTo 0
-        If Not cachedFolder Is Nothing Then
-            LogMsg "GetUnifiedFolder: loaded from registry -> " & cachedFolder.Name
-            Set GetUnifiedFolder = cachedFolder
-            Exit Function
-        End If
-        LogMsg "GetUnifiedFolder: registry entry found but folder lookup failed, prompting user"
-    Else
-        LogMsg "GetUnifiedFolder: no registry entry, prompting user"
     End If
-
-    MsgBox "Please select the folder to use as your Unified Inbox.", vbInformation
-    Set cachedFolder = ns.PickFolder
 
     If cachedFolder Is Nothing Then
-        LogMsg "GetUnifiedFolder: user cancelled folder selection"
-        MsgBox "No folder selected. Unified Inbox sync disabled.", vbExclamation
-        Exit Function
-    End If
+        MsgBox "Choose the real folder you want to use as your Unified Inbox." & vbCrLf & vbCrLf & _
+               "Do NOT choose Outlook's built-in All Inboxes view.", _
+               vbInformation, "Choose Unified Inbox Folder"
 
-    SaveSetting "UnifiedInbox", "Config", "FolderID", cachedFolder.EntryID
-    SaveSetting "UnifiedInbox", "Config", "StoreID", cachedFolder.StoreID
-    LogMsg "GetUnifiedFolder: saved new folder -> " & cachedFolder.Name
+        Set cachedFolder = ns.PickFolder
+
+        If cachedFolder Is Nothing Then
+            MsgBox "No folder selected. The unified inbox sync will not run.", vbExclamation
+            Exit Function
+        End If
+
+        SaveSetting APP_NAME, APP_SECTION, "FolderID", cachedFolder.entryID
+        SaveSetting APP_NAME, APP_SECTION, "StoreID", cachedFolder.storeID
+    End If
 
     Set GetUnifiedFolder = cachedFolder
 End Function
+
+Public Sub ResetUnifiedFolder()
+    On Error Resume Next
+    DeleteSetting APP_NAME, APP_SECTION
+    On Error GoTo 0
+    MsgBox "Unified folder setting reset. Restart Outlook to choose it again.", vbInformation
+End Sub
+
+' =========================
+' TESTING / DEBUG
+' =========================
+
+Public Sub TestUnifiedFolder()
+    Dim f As Outlook.folder
+
+    Set f = GetUnifiedFolder()
+
+    If f Is Nothing Then
+        Debug.Print "No unified folder selected."
+    Else
+        Debug.Print "Unified folder: " & f.FolderPath
+    End If
+End Sub
+
+Public Sub RebuildAllSnapshots()
+    If FolderWatchers Is Nothing Then
+        Debug.Print "FolderWatchers was not initialized. Running ManualStartup first."
+        ManualStartup
+    End If
+
+    If FolderWatchers Is Nothing Then
+        Debug.Print "FolderWatchers is still Nothing after ManualStartup."
+        Exit Sub
+    End If
+
+    RefreshAllSnapshots
+End Sub
+
+Public Sub ShowSelectedItemLinks()
+    Dim mail As Outlook.MailItem
+
+    If Application.ActiveExplorer.Selection.Count = 0 Then
+        Debug.Print "No item selected."
+        Exit Sub
+    End If
+
+    If Not TypeOf Application.ActiveExplorer.Selection.Item(1) Is Outlook.MailItem Then
+        Debug.Print "Selected item is not a mail item."
+        Exit Sub
+    End If
+
+    Set mail = Application.ActiveExplorer.Selection.Item(1)
+
+    Debug.Print "Subject: " & mail.Subject
+    Debug.Print "SOURCE ENTRY:  " & GetUserPropValue(mail, PROP_SOURCE_ENTRYID)
+    Debug.Print "SOURCE STORE:  " & GetUserPropValue(mail, PROP_SOURCE_STOREID)
+    Debug.Print "UNIFIED ENTRY: " & GetUserPropValue(mail, PROP_UNIFIED_ENTRYID)
+    Debug.Print "UNIFIED STORE: " & GetUserPropValue(mail, PROP_UNIFIED_STOREID)
+End Sub
+
 ```
 
-## Resetting the Target Folder
-
-To pick a different unified folder, run this once in the VBA Immediate Window (**Ctrl+G**):
+clsFolderWatcher
 
 ```vb
-DeleteSetting "UnifiedInbox", "Config"
+Option Explicit
+
+Public WithEvents items As Outlook.items
+Public FolderStoreID As String
+Public FolderEntryID As String
+Public FolderPath As String
+Public isUnified As Boolean
+
+Private Sub Items_ItemAdd(ByVal Item As Object)
+    On Error Resume Next
+
+    If isUnified Then Exit Sub
+    If gIsDeleteSyncing Then Exit Sub
+
+    If TypeOf Item Is Outlook.MailItem Then
+        Debug.Print "ItemAdd fired in source inbox: " & FolderPath
+        HandleSourceItemAdd Me, Item
+    End If
+End Sub
+
+Private Sub Items_ItemRemove()
+    On Error Resume Next
+
+    Debug.Print "ItemRemove fired in: " & FolderPath
+    HandleFolderRemove Me
+End Sub
 ```
 
-Then restart Outlook — it will prompt you to pick again.
+ThisOutlookSession
 
-## Troubleshooting
+```vb
+Option Explicit
 
-### Log file
-
-Every run writes to `%USERPROFILE%\UnifiedInbox.log` (e.g. `C:\Users\YourName\UnifiedInbox.log`). Open it in Notepad after a problematic startup.
-
-A healthy startup looks like this:
-
-```
-2024-03-15 08:01:02 | === Outlook started ===
-2024-03-15 08:01:02 | Session stores count: 3
-2024-03-15 08:01:02 | InitWatchers: 3 store(s) found
-2024-03-15 08:01:02 |   Watching inbox: user@gmail.com
-2024-03-15 08:01:02 |   Watching inbox: user@outlook.com
-2024-03-15 08:01:02 |   Watching inbox: Personal Folders
-2024-03-15 08:01:02 | InitWatchers complete, watchers: 3
-2024-03-15 08:01:03 | GetUnifiedFolder: loaded from registry -> Unified Inbox
-2024-03-15 08:01:03 | RunUnifiedSync: starting
-2024-03-15 08:01:04 | SyncInbox: user@gmail.com (47 items)
-2024-03-15 08:01:04 |   Hit already-synced item at k=2, stopping
-2024-03-15 08:01:04 | SyncInbox done: processed 2 candidate(s)
-...
-2024-03-15 08:01:05 | RunUnifiedSync: finished
-2024-03-15 08:01:05 | Startup complete
+Private Sub Application_Startup()
+    ManualStartup
+End Sub
 ```
 
-### Common problems
 
-| Symptom in log | Likely cause | Fix |
-|---|---|---|
-| `stores count: 0` or `stores count: 1` | Outlook not fully loaded when macro fired | Outlook takes a few seconds to connect accounts on startup; the 5-minute timer sweep will catch up automatically |
-| `watchers: 0` | No inbox folders found across any store | Check that accounts are fully configured and connected |
-| `GetUnifiedFolder: registry entry found but folder lookup failed` | Unified folder was deleted or moved | Run `DeleteSetting "UnifiedInbox", "Config"` in the Immediate Window and restart |
-| `RunUnifiedSync: already running, skipped` | A previous sync is still in progress | Normal if the inbox is large; subsequent timer runs will catch up |
-| `RunUnifiedSync ERROR: ...` | Exception during sync | Share the full error description for diagnosis |
-| No log file created at all | Macros not enabled | File → Options → Trust Center → Macro Settings → Enable all macros |
+## Resetting the selected unified folder
 
-### Sending logs to support
+If you want Outlook to ask you to choose the unified folder again, run this in the Immediate Window:
 
-1. Open `%USERPROFILE%\UnifiedInbox.log` in Notepad
-2. Copy the lines from the startup session where the problem occurred (starting from `=== Outlook started ===`)
-3. Share those lines — do not share the entire file if it contains subject lines you want to keep private
+Notes
+This project is for Outlook Classic, not New Outlook.
+It works best with new messages processed after setup.
+Older messages that were copied before metadata linking was added may not support full two-way delete syncing.
+Bulk deletes may not behave perfectly because Outlook VBA delete events are limited and do not directly identify the removed item.
+This is a VBA macro project, not a COM add-in.
 
-## Notes
+Known limitations
 
-- Emails are **copied** (not moved) from each inbox into the unified folder
-- The unified folder can be in any account or a local PST
-- Works with any number of accounts (Exchange, IMAP, POP3)
-- The periodic sweep stops scanning an inbox as soon as it hits an already-synced email — if you manually delete emails from the unified folder they will not be re-synced on the next sweep (only future new arrivals are caught via `ItemAdd`)
-- Requires macros to be enabled: File → Options → Trust Center → Macro Settings → Enable all macros
+- Delete syncing depends on Outlook item events and stored metadata.
+- Existing older copied items may not be fully linked.
+- Behavior can vary by account type and store type.
+- Very large or rapid mailbox changes may require rebuilding snapshots.
+
+
+Customization ideas
+
+This project is intentionally simple and can be customized to:
+
+- exclude certain accounts
+- exclude certain folders
+- filter by sender or subject
+- skip duplicates
+- log activity more aggressively
+- add better error handling
+- expand sync behavior beyond delete handling
+
+
+License
+
+MIT License
+
+Copyright (c) 2026
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
